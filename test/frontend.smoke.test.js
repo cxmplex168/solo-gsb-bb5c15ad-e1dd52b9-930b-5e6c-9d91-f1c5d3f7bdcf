@@ -43,14 +43,14 @@ function makeEl(tag) {
     dispatch(t, ev) { (this.listeners[t] || []).forEach((fn) => fn(ev || {})); },
     querySelector(sel) {
       const all = [];
-      const walk = (n) => n.children.forEach((c) => { all.push(c); walk(c); });
+      const walk = (n) => (n.children || []).forEach((c) => { all.push(c); walk(c); });
       walk(this);
       if (sel === '.status-cell') return all.find((c) => c.className === 'status-cell');
       return all.find((c) => c.className === sel.slice(1));
     },
     querySelectorAll() {
       const all = [];
-      const walk = (n) => n.children.forEach((c) => { all.push(c); walk(c); });
+      const walk = (n) => (n.children || []).forEach((c) => { all.push(c); walk(c); });
       walk(this);
       return all;
     },
@@ -171,6 +171,11 @@ vm.runInContext(code, sandbox);
   assert.ok(previewText.includes('请求行为回归预演'), '预览应包含样例对比区块');
   assert.ok(previewText.includes('命中改变'), '应标出命中规则改变的样例');
   assert.ok(previewText.includes('#1 GET /api/users/:id'), '应展示建议顺序下的新命中规则');
+  // 路由行为契约纳入同一约束图：建议顺序下 3 条契约全部成立（修复 2 条）
+  assert.ok(previewText.includes('路由行为契约修复前后'), '预览应包含契约修复前后区块');
+  assert.ok(/修复 2/.test(previewText), '应显示 2 条契约被修复');
+  assert.ok(/调整后成立 3/.test(previewText), '建议顺序下 3 条契约应全部成立');
+  assert.ok(previewText.includes('目标规则移至 #1'), '应预览 hit 契约目标规则的新位置');
 
   // 3) 一次应用
   const applyBtn = els['fix-plan']
@@ -190,12 +195,81 @@ vm.runInContext(code, sandbox);
   assert.strictEqual(els['fix-plan'].hidden, true, '应用后应收起预览');
   assert.strictEqual(els['btn-fix'].hidden, true, '无遮蔽时修复按钮应隐藏');
 
+  // 3a) 契约的期望规则随重排按“原规则目标”自动重映射：
+  // 原 #3(/api/users/:id) 移到 #1、原 #5(/assets/css/*) 移到 #4
+  const remappedContracts = JSON.parse(storage['route-conflict-lab.contracts.v1']);
+  const hitId = remappedContracts.find((c) => c.path === '/api/users/:id' && c.expect === 'hit');
+  const hitCss = remappedContracts.find((c) => c.path === '/assets/css/*' && c.expect === 'hit');
+  assert.strictEqual(hitId.ruleIndex, 0, '#3 目标应重映射到第 1 位（0-based 0）');
+  assert.strictEqual(hitCss.ruleIndex, 3, '#5 目标应重映射到第 4 位（0-based 3）');
+  // 重算后三条契约全部成立
+  await new Promise((r) => setTimeout(r, 30));
+  const contractTextAfter = els['contracts-list'].textContent;
+  assert.strictEqual((contractTextAfter.match(/契约成立/g) || []).length, 3, '应用后 3 条契约均应成立');
+  assert.ok(!contractTextAfter.includes('契约被违反'), '应用后不应再有契约被违反');
+
   // 3b) 应用修复后样例自动重算：/api/users/:id 提升为第 1 位并被首条命中
   const samplesAfter = els['samples-result'].textContent;
   assert.ok(
     samplesAfter.includes('#1 GET /api/users/:id'),
     '应用修复后应命中提升后的 :id 规则'
   );
+
+  // 3c) 路由行为契约面板（此时规则仍为应用后的 8 条）：全空间验证 + 反例 + 新增/校验 + 清空
+  const contractRows = els['contracts-list']
+    .querySelectorAll()
+    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
+  assert.strictEqual(contractRows.length, 3, '应渲染 3 条默认契约');
+  const contractText = els['contracts-list'].textContent;
+  assert.ok(contractText.includes('契约成立'), '应用后无匹配契约（POST /api/users/:id）仍成立');
+  // 应用后三条契约全部成立（步骤 3a 已断言），这里再核一次计数
+  assert.strictEqual((contractText.match(/契约成立/g) || []).length, 3, '应用后应 3 条契约全部成立');
+
+  // 点击其中一条 hit 契约的目标芯片可定位（无反例时改为直接校验期望下拉选项数量）
+  els['btn-contract-add'].dispatch('click');
+  await new Promise((r) => setTimeout(r, 30));
+  let rowsNow = els['contracts-list']
+    .querySelectorAll()
+    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
+  assert.strictEqual(rowsNow.length, 4, '应新增一条契约');
+  const newRow = rowsNow[3];
+  const newPath = newRow.querySelector('.contract-path');
+  const newExpect = newRow.querySelector('.contract-expect');
+  const expectOpts = newExpect.children.filter((c) => String(c.tagName).toUpperCase() === 'OPTION');
+  assert.strictEqual(expectOpts.length, 9, '期望选项应为 none + 当前 8 条规则');
+  assert.ok(expectOpts[1].textContent.includes('#1'), '规则选项应带 1-based 序号');
+
+  // 编辑新契约为非法路径模式 -> 逐条提示“无效契约”且不参与验证
+  newPath.value = 'bad-path';
+  newPath.dispatch('input');
+  await new Promise((r) => setTimeout(r, 250)); // 防抖 150ms
+  rowsNow = els['contracts-list']
+    .querySelectorAll()
+    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
+  const invalidRowText = rowsNow[3].textContent;
+  assert.ok(invalidRowText.includes('无效契约'), '非法路径契约应标注为无效且不参与验证');
+  assert.ok(invalidRowText.includes('路径必须以 / 开头'), '应逐条给出语法错误原因');
+  assert.ok(
+    els['contracts-summary'].textContent.includes('无效'),
+    '摘要应统计无效契约数'
+  );
+
+  // 清空全部契约（删除 4 行），使后续步骤 4 在“无 contracts 请求”语义下评估（验证向后兼容）
+  for (let k = 0; k < 4; k++) {
+    const cur = els['contracts-list']
+      .querySelectorAll()
+      .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
+    if (cur.length === 0) break;
+    const del = cur[cur.length - 1].children[cur[cur.length - 1].children.length - 1];
+    del.dispatch('click');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  rowsNow = els['contracts-list']
+    .querySelectorAll()
+    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
+  assert.strictEqual(rowsNow.length, 0, '应已清空全部契约');
+  const savedContracts = JSON.parse(storage['route-conflict-lab.contracts.v1']);
+  assert.ok(Array.isArray(savedContracts) && savedContracts.length === 0, '清空后契约应持久化为空数组');
 
   // 4) 不可消除场景：导入含等价重复规则的规则集，预览必须如实标注残留遮蔽
   sandbox.FileReader = class {
@@ -307,83 +381,7 @@ vm.runInContext(code, sandbox);
     '回填后预演应立即按当前规则重算命中'
   );
 
-  // 8) 路由行为契约：默认契约随首次分析完成全空间验证（1 成立 / 2 违反）
-  const contractRows = els['contracts-list']
-    .querySelectorAll()
-    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
-  assert.strictEqual(contractRows.length, 3, '应渲染 3 条默认契约');
-  const contractText = els['contracts-list'].textContent;
-  assert.ok(contractText.includes('契约成立'), '应无匹配的契约（POST /api/users/:id）成立');
-  const failCount = (contractText.match(/契约被违反/g) || []).length;
-  assert.strictEqual(failCount, 2, '两条 hit 契约应被默认规则顺序违反');
-  // 反例确定性：#3 的最短反例为 GET /api/users/a（实际命中 #1 /api/*）
-  const ce = els['contracts-list']
-    .querySelectorAll()
-    .find((c) => c.className === 'ct-counterex' && c.textContent === 'GET /api/users/a');
-  assert.ok(ce, '应给出确定性最短反例 GET /api/users/a');
-  assert.ok(
-    els['contracts-summary'].textContent.includes('违反'),
-    '契约摘要应包含违反计数'
-  );
-  assert.ok(
-    storage['route-conflict-lab.contracts.v1'],
-    '契约应保存到 localStorage'
-  );
-
-  // 8b) 点击反例 -> 回填请求预演并自动重算
-  const samplesBefore = els['samples-input'].value.split('\n').length;
-  ce.dispatch('click');
-  await new Promise((r) => setTimeout(r, 30));
-  const sampleLines = els['samples-input'].value.split('\n');
-  assert.ok(
-    sampleLines.includes('GET /api/users/a'),
-    '反例应回填到请求预演输入框'
-  );
-  assert.ok(sampleLines.length > samplesBefore, '回填应追加而非覆盖已有样例');
-  assert.ok(
-    els['samples-result'].textContent.includes('GET /api/users/a'),
-    '回填后预演应立即重算'
-  );
-
-  // 8c) 新增契约：下拉框选项由当前规则生成
-  els['btn-contract-add'].dispatch('click');
-  await new Promise((r) => setTimeout(r, 30));
-  let rowsNow = els['contracts-list']
-    .querySelectorAll()
-    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
-  assert.strictEqual(rowsNow.length, 4, '应新增一条契约');
-  const newRow = rowsNow[3];
-  const newPath = newRow.querySelector('.contract-path');
-  const newExpect = newRow.querySelector('.contract-expect');
-  const expectOpts = newExpect.children.filter((c) => String(c.tagName).toUpperCase() === 'OPTION');
-  assert.strictEqual(expectOpts.length, 5, '期望选项应为 none + 当前 4 条规则');
-  assert.ok(expectOpts[1].textContent.includes('#1'), '规则选项应带 1-based 序号');
-
-  // 8d) 编辑新契约为非法路径模式 -> 逐条提示“无效契约”且不参与验证；随后删除
-  newPath.value = 'bad-path';
-  newPath.dispatch('input');
-  await new Promise((r) => setTimeout(r, 250)); // 防抖 150ms
-  rowsNow = els['contracts-list']
-    .querySelectorAll()
-    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
-  const invalidRowText = rowsNow[3].textContent;
-  assert.ok(invalidRowText.includes('无效契约'), '非法路径契约应标注为无效且不参与验证');
-  assert.ok(invalidRowText.includes('路径必须以 / 开头'), '应逐条给出语法错误原因');
-  const summaryDuringInvalid = els['contracts-summary'].textContent;
-  assert.ok(summaryDuringInvalid.includes('无效'), '摘要应统计无效契约数');
-  // 删除该无效契约，保持后续步骤状态干净
-  const delBtn = rowsNow[3].children[rowsNow[3].children.length - 1];
-  delBtn.dispatch('click');
-  await new Promise((r) => setTimeout(r, 30));
-  rowsNow = els['contracts-list']
-    .querySelectorAll()
-    .filter((c) => String(c.tagName).toUpperCase() === 'LI' && c.dataset && c.dataset.index !== undefined);
-  assert.strictEqual(rowsNow.length, 3, '删除后应恢复为 3 条契约');
-
-  const savedContracts = JSON.parse(storage['route-conflict-lab.contracts.v1']);
-  assert.ok(Array.isArray(savedContracts) && savedContracts.length === 3, '删除后契约已持久化');
-
-  // 9) 清除基线 -> 恢复空态，本地存储同步移除
+  // 9) 清除基线 -> 恢复空态，本地存储同步移除（契约已在步骤 3c 清空）
   els['btn-baseline-clear'].dispatch('click');
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(

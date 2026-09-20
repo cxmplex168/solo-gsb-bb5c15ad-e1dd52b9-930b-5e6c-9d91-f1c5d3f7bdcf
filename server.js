@@ -21,7 +21,9 @@ app.use(express.static(path.join(__dirname, 'public')));
  * baselineRules 可选：基线路由表（旧版本规则），携带时按首条命中语义
  * 与当前规则表做全空间版本差异审计，响应附带 diff 字段。
  * contracts 可选：路由行为契约数组（字符串行或 { method, path, expect, ruleIndex }
- * 对象），携带时在契约覆盖的整个请求空间上验证当前优先级，响应附带 contracts 字段。
+ * 对象），携带时在契约覆盖的整个请求空间上验证当前优先级，响应附带 contracts 字段；
+ * 其中有效的命中型契约还会并入 fixPlan 的同一约束图（见 analyzer.buildFixPlan），
+ * 目标不全覆盖 / none 空间已命中 / 合并后成环时 fixPlan.feasible=false 且不返回顺序。
  */
 app.post('/api/analyze', (req, res) => {
   const body = req.body || {};
