@@ -1138,11 +1138,17 @@ function renderFixPlan(fp) {
   fixEl.hidden = false;
   fixEl.innerHTML = '';
 
+  // 不可通过重排满足契约：只展示诊断（契约 / 最短见证 / 冲突约束），不提供可应用方案
+  if (fp.feasible === false) {
+    renderInfeasibleFix(fp);
+    return;
+  }
+
   const head = document.createElement('div');
   head.className = 'fix-head';
   const title = document.createElement('span');
   title.className = 'fix-title';
-  title.textContent = '🛠 修复方案（按语言等价关系分组 + 约束图拓扑排序）';
+  title.textContent = '🛠 修复方案（严格覆盖约束 + 契约约束合并后的确定性重排）';
   head.appendChild(title);
 
   // 汇总：调整前后遮蔽数量 + 仍不可避免的遮蔽数量
@@ -1156,13 +1162,16 @@ function renderFixPlan(fp) {
   stats.appendChild(fixStat('stat-move', '需移动规则', fp.moves.length));
 
   const verdict = document.createElement('div');
+  const contractFailFixed =
+    fp.contracts && fp.contracts.failBefore > 0 && fp.contracts.failAfter === 0;
   verdict.className = `fix-verdict ${fp.shadowAfter === 0 ? 'fv-ok' : 'fv-warn'}`;
-  if (fp.shadowBefore === 0) {
+  if (fp.shadowBefore === 0 && !(fp.contracts && fp.contracts.failBefore > 0)) {
     verdict.textContent = '当前没有需要修复的遮蔽。';
-  } else if (fp.shadowAfter === 0) {
+  } else if (fp.shadowAfter === 0 && !(fp.contracts && fp.contracts.failAfter > 0)) {
     verdict.textContent =
-      `✅ 该顺序可消除全部 ${fp.shadowBefore} 条遮蔽（被消除的遮蔽会转为部分重叠，仍在下方冲突卡片中标注）。`;
-  } else if (fp.fixedCount > 0) {
+      `✅ 该顺序可消除全部 ${fp.shadowBefore} 条遮蔽（被消除的遮蔽会转为部分重叠，仍在下方冲突卡片中标注）` +
+      (contractFailFixed ? '，并满足全部有效契约。' : '。');
+  } else if (fp.fixedCount > 0 || (fp.contracts && fp.contracts.failBefore > 0)) {
     verdict.textContent =
       `⚠️ 重排可消除 ${fp.fixedCount} 条遮蔽，但仍有 ${fp.unavoidableShadow} 条遮蔽不可避免` +
       `（互相覆盖的等价规则无法通过排序消除）；调整后遮蔽 ${fp.shadowBefore} → ${fp.shadowAfter}。`;
@@ -1274,6 +1283,9 @@ function renderFixPlan(fp) {
     }
   }
 
+  // 契约修复前后状态（同一批契约在当前顺序与建议顺序下的全空间验证结果）
+  const contractBox = renderFixContracts(fp);
+
   // 操作按钮：预览后一次应用 / 取消
   const actions = document.createElement('div');
   actions.className = 'fix-actions';
@@ -1292,7 +1304,182 @@ function renderFixPlan(fp) {
   cancelBtn.addEventListener('click', () => closeFix());
   actions.append(applyBtn, cancelBtn);
 
-  fixEl.append(head, stats, verdict, orderBox, replayBox, groupsBox, remainBox, actions);
+  fixEl.append(head, stats, verdict, orderBox, contractBox, replayBox, groupsBox, remainBox, actions);
+}
+
+/* ---------------- 修复方案 × 路由行为契约 ---------------- */
+
+const CONTRACT_STATUS_TEXT = {
+  pass: '✔ 成立',
+  fail: '✘ 违反',
+  truncated: '⚠ 未完成全空间验证',
+};
+
+/** 可行方案：契约修复前后状态对比区块（无契约时返回空节点） */
+function renderFixContracts(fp) {
+  const box = document.createElement('div');
+  if (!fp.contracts) return box;
+  const fc = fp.contracts;
+  if (!fc.results || fc.results.length === 0) return box;
+  box.className = 'fix-contracts';
+
+  const label = document.createElement('div');
+  label.className = 'fix-section-label';
+  label.textContent =
+    `契约状态（修复前 → 修复后）：成立 ${fc.passBefore} → ${fc.passAfter}` +
+    ` · 违反 ${fc.failBefore} → ${fc.failAfter}` +
+    (fc.truncatedBefore + fc.truncatedAfter > 0
+      ? ` · 未完成 ${fc.truncatedBefore} → ${fc.truncatedAfter}`
+      : '');
+  box.appendChild(label);
+
+  for (const r of fc.results) {
+    const row = document.createElement('div');
+    const fixed = r.before !== 'pass' && r.after === 'pass';
+    const broke = r.after === 'fail';
+    row.className =
+      'fc-row' +
+      (fixed ? ' fc-fixed' : '') +
+      (broke ? ' fc-broke' : '');
+
+    const name = document.createElement('span');
+    name.className = 'fc-name';
+    name.textContent = r.contract;
+
+    const before = document.createElement('span');
+    before.className = `fc-state fcs-${r.before}`;
+    before.textContent = `修复前：${CONTRACT_STATUS_TEXT[r.before] || r.before}`;
+
+    const arrow = document.createElement('span');
+    arrow.className = 'fc-arrow';
+    arrow.textContent = '→';
+
+    const after = document.createElement('span');
+    after.className = `fc-state fcs-${r.after}`;
+    after.textContent = `修复后：${CONTRACT_STATUS_TEXT[r.after] || r.after}`;
+
+    row.append(name, before, arrow, after);
+    box.appendChild(row);
+  }
+  return box;
+}
+
+/** 不可行方案：逐条列出不可通过重排满足的契约、最短见证与冲突约束，无应用按钮 */
+function renderInfeasibleFix(fp) {
+  const head = document.createElement('div');
+  head.className = 'fix-head';
+  const title = document.createElement('span');
+  title.className = 'fix-title title-danger';
+  title.textContent = '🛑 修复方案不可应用：存在无法通过重排满足的路由行为契约';
+  head.appendChild(title);
+
+  const banner = document.createElement('div');
+  banner.className = 'fix-infeasible-banner';
+  const fc = fp.contracts;
+  banner.textContent =
+    `严格覆盖约束与 ${fc.unsatisfiable.length} 条命中型契约约束合并后无法同时满足` +
+    `（目标不全覆盖契约空间 / 契约空间已被“应无匹配”契约外的规则覆盖 / 合并约束成环）。` +
+    '下列契约的任何重排方案都无法满足，需改写路径、增删规则或修改契约期望；未提供可应用顺序。';
+  fixEl.appendChild(head);
+  fixEl.appendChild(banner);
+
+  for (const u of fc.unsatisfiable) {
+    const card = document.createElement('div');
+    card.className = 'unsat-card';
+
+    const line1 = document.createElement('div');
+    line1.className = 'unsat-head';
+    const name = document.createElement('span');
+    name.className = 'unsat-name';
+    name.textContent = u.contract;
+    const reason = document.createElement('span');
+    reason.className = 'unsat-reason';
+    reason.textContent = u.reasonText;
+    line1.append(name, reason);
+    card.appendChild(line1);
+
+    if (u.witness) {
+      const wline = document.createElement('div');
+      wline.className = 'unsat-witness';
+      const lab = document.createElement('span');
+      lab.className = 'unsat-label';
+      lab.textContent = '最短见证请求';
+      const w = document.createElement('button');
+      w.type = 'button';
+      w.className = 'ct-counterex';
+      w.textContent = u.witness.text;
+      w.title = '点击回填到请求预演';
+      w.addEventListener('click', () => backfillWitness(u.witness.text));
+      const actual = document.createElement('span');
+      actual.className = 'unsat-actual';
+      if (u.witness.actualHit) {
+        const hitBtn = document.createElement('button');
+        hitBtn.type = 'button';
+        hitBtn.className = 'unsat-hit';
+        hitBtn.textContent =
+          `#${u.witness.actualHit.index + 1} ${u.witness.actualHit.method} ${u.witness.actualHit.path}`;
+        hitBtn.title = '点击定位到该规则（当前优先级下的实际首条命中）';
+        hitBtn.addEventListener('click', () => locateRule(u.witness.actualHit.index));
+        actual.append('当前实际首条命中：', hitBtn);
+      } else {
+        actual.textContent = '当前实际：（无匹配）';
+      }
+      wline.append(lab, w, actual);
+      card.appendChild(wline);
+    }
+
+    if (u.conflicts && u.conflicts.length > 0) {
+      const cbox = document.createElement('div');
+      cbox.className = 'unsat-conflicts';
+      const clab = document.createElement('div');
+      clab.className = 'unsat-label';
+      clab.textContent = '冲突约束（合并不可能同时成立的排序要求）';
+      cbox.appendChild(clab);
+      u.conflicts.forEach((c, i) => {
+        const cline = document.createElement('div');
+        cline.className = 'conflict-line';
+        const no = document.createElement('span');
+        no.className = 'conflict-no';
+        no.textContent = `${i + 1}.`;
+        const text = document.createElement('span');
+        text.className = 'conflict-text';
+        if (c.kind === 'coverage') {
+          const a = document.createElement('button');
+          a.type = 'button';
+          a.className = 'conflict-rule-link';
+          a.textContent = `#${c.narrower.index + 1} ${c.narrower.method} ${c.narrower.path}`;
+          a.addEventListener('click', () => locateRule(c.narrower.index));
+          const mid = document.createElement('span');
+          mid.textContent = ' 必须排在 ';
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'conflict-rule-link';
+          b.textContent = `#${c.wider.index + 1} ${c.wider.method} ${c.wider.path}`;
+          b.addEventListener('click', () => locateRule(c.wider.index));
+          const tail = document.createElement('span');
+          tail.textContent = ' 之前（路径严格覆盖约束）';
+          text.append(a, mid, b, tail);
+        } else {
+          text.textContent = c.detail || c.reason;
+        }
+        cline.append(no, text);
+        cbox.appendChild(cline);
+      });
+      card.appendChild(cbox);
+    }
+
+    fixEl.appendChild(card);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'fix-actions';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'btn btn-ghost';
+  cancelBtn.textContent = '收起预览';
+  cancelBtn.addEventListener('click', () => closeFix());
+  actions.appendChild(cancelBtn);
+  fixEl.appendChild(actions);
 }
 
 /** 修复预览中的单条样例对比行：当前命中 → 建议顺序命中 */
@@ -1389,15 +1576,36 @@ function applyFix(fp) {
     scheduleAnalyze(true);
     return;
   }
+  // 应用重排：规则一一对应（内容不变，仅顺序变化）。命中型契约仍按“原规则目标”
+  // 自动重映射：把 ruleIndex 从旧位置换算到新位置，并持久化
+  const newPosOf = new Array(fp.order.length);
+  fp.order.forEach((origIdx, pos) => {
+    newPosOf[origIdx] = pos;
+  });
+  let remappedContracts = 0;
+  contracts = contracts.map((c) => {
+    if (c.expect === 'hit' && Number.isInteger(c.ruleIndex)) {
+      remappedContracts++;
+      return { ...c, ruleIndex: newPosOf[c.ruleIndex] };
+    }
+    return c;
+  });
   rules = next;
   saveRules();
+  if (remappedContracts > 0) saveContracts();
   closeFix();
   renderRules();
+  renderContracts();
   scheduleAnalyze(true);
+  const fc = fp.contracts;
+  const contractNote =
+    fc && fc.failAfter === 0 && fc.passAfter > 0
+      ? `，${fc.passAfter} 条契约全部成立（期望规则已自动重映射）`
+      : '';
   showToast(
     fp.shadowAfter === 0
-      ? '已应用修复方案：遮蔽全部消除'
-      : `已应用修复方案：仍有 ${fp.shadowAfter} 条不可避免的遮蔽`,
+      ? `已应用修复方案：遮蔽全部消除${contractNote}`
+      : `已应用修复方案：仍有 ${fp.shadowAfter} 条不可避免的遮蔽${contractNote}`,
     fp.shadowAfter === 0 ? 'ok' : 'error'
   );
 }

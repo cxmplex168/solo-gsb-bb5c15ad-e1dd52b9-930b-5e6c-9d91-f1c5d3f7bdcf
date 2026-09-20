@@ -903,5 +903,224 @@ check('contracts: 确定性——同一输入多次计算反例一致', () => {
   assert.strictEqual(a.results[0].counterexample.text, 'GET /api/users/a');
 });
 
+// ---------- 修复方案 × 命中型契约约束（合并约束图） ----------
+check('fixPlan.contracts: 目标覆盖契约全空间时加入“目标在前”约束，重排后契约成立', () => {
+  const res = analyze(
+    [
+      { id: 'wide', method: 'GET', path: '/api/*' },
+      { id: 'spec', method: 'GET', path: '/api/users/:id' },
+    ],
+    { contracts: ['GET /api/users/:id -> #2'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, true);
+  assert.deepStrictEqual(f.order, [1, 0]);
+  const fc = f.contracts;
+  assert.strictEqual(fc.total, 1);
+  assert.strictEqual(fc.failBefore, 1);
+  assert.strictEqual(fc.passAfter, 1);
+  assert.strictEqual(fc.failAfter, 0);
+  assert.deepStrictEqual(fc.unsatisfiable, []);
+  assert.strictEqual(fc.results[0].before, 'fail');
+  assert.strictEqual(fc.results[0].after, 'pass');
+  // 契约边：目标 spec 必须位于竞争规则 wide 之前
+  const ce = f.constraints.find((c) => c.kind === 'contract');
+  assert.ok(ce);
+  assert.strictEqual(ce.target.id, 'spec');
+  assert.strictEqual(ce.competitor.id, 'wide');
+});
+
+check('fixPlan.contracts: 目标不全覆盖契约空间 -> 不可行，给最短见证，不提供方案', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/api/*' },
+      { method: 'GET', path: '/api/users/:id' },
+    ],
+    { contracts: ['GET /api/users/* -> #2'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, false);
+  assert.deepStrictEqual(f.order, []); // 不提供可应用顺序
+  assert.deepStrictEqual(f.moves, []);
+  assert.strictEqual(f.contracts.unsatisfiable.length, 1);
+  const u = f.contracts.unsatisfiable[0];
+  assert.strictEqual(u.reason, 'target-not-cover');
+  // :id 不覆盖 /api/users（* 零段）
+  assert.strictEqual(u.witness.text, 'GET /api/users');
+  assert.ok(u.conflicts.length >= 1);
+});
+
+check('fixPlan.contracts: none 契约空间已被规则覆盖 -> 不可行（重排不改变可命中集合）', () => {
+  const res = analyze(
+    [{ method: 'GET', path: '/api/users/:id' }],
+    { contracts: ['GET /api/users/* -> none'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, false);
+  assert.strictEqual(f.contracts.unsatisfiable[0].reason, 'covered');
+  assert.strictEqual(f.contracts.unsatisfiable[0].witness.text, 'GET /api/users/a');
+});
+
+check('fixPlan.contracts: none 契约空间完全无覆盖时可行，前后均成立，不产生约束', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/*' },
+      { method: 'GET', path: '/x' },
+    ],
+    { contracts: ['POST /y/:id -> none'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, true);
+  assert.strictEqual(f.contracts.passBefore, 1);
+  assert.strictEqual(f.contracts.passAfter, 1);
+  assert.ok(!f.constraints.some((c) => c.kind === 'contract'));
+});
+
+check('fixPlan.contracts: 契约边与严格覆盖边方向相反 -> 成环，标出契约/见证/冲突约束', () => {
+  // 覆盖约束：/a/b/c 必须在 /a/* 必须在 /* 之前；
+  // 契约 GET /a/b/c -> #3(/*) 要求 /* 在 /a/b/c 之前 -> 环
+  const res = analyze(
+    [
+      { id: 'root', method: 'GET', path: '/*' },
+      { id: 'mid', method: 'GET', path: '/a/*' },
+      { id: 'leaf', method: 'GET', path: '/a/b/c' },
+    ],
+    { contracts: ['GET /a/b/c -> #1'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, false);
+  assert.deepStrictEqual(f.order, []);
+  const u = f.contracts.unsatisfiable[0];
+  assert.strictEqual(u.reason, 'cycle');
+  assert.strictEqual(u.witness.text, 'GET /a/b/c');
+  // 冲突约束至少含一条覆盖边与闭合环的契约边
+  assert.ok(u.conflicts.some((c) => c.kind === 'coverage'));
+  assert.ok(u.conflicts.some((c) => c.kind === 'contract'));
+});
+
+check('fixPlan.contracts: 等价组内原本在前的同语言竞争规则 -> 不可行（组内不重排）', () => {
+  const res = analyze(
+    [
+      { id: 'a', method: 'GET', path: '/x' },
+      { id: 'b', method: 'GET', path: '/x' },
+    ],
+    { contracts: ['GET /x -> #2'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, false);
+  assert.strictEqual(f.contracts.unsatisfiable[0].reason, 'equivalent-group');
+  assert.strictEqual(f.contracts.unsatisfiable[0].witness.text, 'GET /x');
+});
+
+check('fixPlan.contracts: 目标原本就在等价组首位时契约可行（无需组内重排）', () => {
+  const res = analyze(
+    [
+      { id: 'a', method: 'GET', path: '/x' },
+      { id: 'b', method: 'GET', path: '/x' },
+    ],
+    { contracts: ['GET /x -> #1'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, true);
+  assert.strictEqual(f.contracts.passAfter, 1);
+});
+
+check('fixPlan.contracts: 目标规则方法不兼容 -> 不可行，见证为契约最短具体请求', () => {
+  const res = analyze(
+    [{ method: 'POST', path: '/x/:id' }],
+    { contracts: ['GET /x/:id -> #1'] }
+  );
+  const u = res.fixPlan.contracts.unsatisfiable[0];
+  assert.strictEqual(res.fixPlan.feasible, false);
+  assert.strictEqual(u.reason, 'target-incompatible');
+  assert.strictEqual(u.witness.text, 'GET /x/a');
+});
+
+check('fixPlan.contracts: 契约与遮蔽修复共存——同一顺序同时消遮蔽并满足全部契约', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/api/*' },
+      { method: 'GET', path: '/api/users/*' },
+      { method: 'GET', path: '/api/users/:id' },
+    ],
+    { contracts: ['GET /api/users/:id -> #3'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, true);
+  assert.strictEqual(f.shadowAfter, 0);
+  assert.strictEqual(f.contracts.passAfter, 1);
+  assert.deepStrictEqual(f.order, [2, 1, 0]);
+});
+
+check('fixPlan.contracts: 无交集/异方法规则不产生契约约束', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/a/:id' },
+      { method: 'GET', path: '/b/:id' },
+      { method: 'POST', path: '/a/:id' },
+    ],
+    { contracts: ['GET /a/:id -> #1'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, true);
+  assert.strictEqual(f.constraints.filter((c) => c.kind === 'contract').length, 0);
+  assert.deepStrictEqual(f.order, [0, 1, 2]);
+});
+
+check('fixPlan.contracts: 无效契约不参与约束图，也不阻塞可行方案', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/api/*' },
+      { method: 'GET', path: '/api/x' },
+    ],
+    { contracts: ['ALL /api/x -> #1', 'GET /api/x -> #2'] }
+  );
+  const f = res.fixPlan;
+  assert.strictEqual(f.feasible, true);
+  assert.strictEqual(f.contracts.total, 1); // 仅有效契约计数
+  assert.strictEqual(f.contracts.results.length, 1);
+  assert.strictEqual(f.contracts.passAfter, 1);
+});
+
+check('fixPlan.contracts: truncated 契约仍参与精确逐对约束判定（不伪判可行/不可行）', () => {
+  // 正常规模下 truncated 不会出现；该用例确认普通契约字段齐全
+  const f = analyze(
+    [
+      { method: 'GET', path: '/a/*' },
+      { method: 'GET', path: '/a/b' },
+    ],
+    { contracts: ['GET /a/b -> #2'] }
+  ).fixPlan;
+  assert.strictEqual(f.contracts.truncatedBefore, 0);
+  assert.strictEqual(f.contracts.truncatedAfter, 0);
+});
+
+check('fixPlan.contracts: 确定性——同一输入两次计算 unsat/顺序/前后状态一致', () => {
+  const rules = [
+    { method: 'GET', path: '/*' },
+    { method: 'GET', path: '/a/*' },
+    { method: 'GET', path: '/a/b/c' },
+  ];
+  const opts = { contracts: ['GET /a/b/c -> #1', 'GET /a/* -> none'] };
+  const a = analyze(rules, opts).fixPlan;
+  const b = analyze(rules, opts).fixPlan;
+  assert.strictEqual(a.feasible, b.feasible);
+  assert.deepStrictEqual(
+    a.contracts.unsatisfiable.map((u) => [u.contract, u.reason, u.witness.text]),
+    b.contracts.unsatisfiable.map((u) => [u.contract, u.reason, u.witness.text])
+  );
+});
+
+check('fixPlan.contracts: 不传 contracts 时 fixPlan 不含 contracts 字段（向后兼容）', () => {
+  const f = analyze([
+    { method: 'GET', path: '/api/*' },
+    { method: 'GET', path: '/api/x' },
+  ]).fixPlan;
+  assert.strictEqual('contracts' in f, false);
+  // 既有 coverage 约束结构保持兼容：narrower/wider 字段仍在
+  assert.ok(f.constraints[0].narrower);
+  assert.ok(f.constraints[0].wider);
+});
+
 
 console.log(`\n全部 ${passed} 个测试通过。`);
