@@ -1,0 +1,16 @@
+{
+  "name": "route-conflict-lab",
+  "version": "1.0.0",
+  "description": "HTTP 路由冲突实验室：编辑按优先级排列的路由规则，实时判定完全遮蔽与部分重叠，并生成最短示例路径。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/engine.test.js && node test/frontend.smoke.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
